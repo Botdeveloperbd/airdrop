@@ -8,6 +8,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from telegram.helpers import escape_markdown
 from config import BOT_TOKEN, ADMIN_ID
 from database import Database
 from rate_limiter import RateLimiter
@@ -180,7 +181,7 @@ class AirdropBot:
             elif callback_data == "balance":
                 await self.balance(query, context)
             elif callback_data == "set_wallet":
-                await query.message.reply_text("🪙 *Usage*:\n/wallet 0xYourBEP20Address")
+                await query.message.reply_text("🪙 *Usage*:\n`/wallet 0xYourBEP20Address`")
                 await query.answer()
             elif callback_data == "withdraw":
                 await self.withdraw(query, context)
@@ -273,12 +274,15 @@ class AirdropBot:
 
             reply_markup = self._get_main_menu(user_id)
             await update.message.reply_text(
-                f"👋 *Welcome to the USDT Airdrop Bot!*\n"
-                f"💰 Check your earnings or withdraw USDT\n"
-                f"🎯 Invite friends: `{invite_link}`\n"
-                f"📋 Use the buttons below to interact:",
+                f"👋 *Welcome to Joy2025 — Your Gateway to Easy Earnings!*\n\n"
+                f"💸 *Earn Free USDT Instantly!*\n"
+                f"🚀 Invite your friends and skyrocket your rewards!\n\n"
+                f"🔗 *Your Invite Link:* `{invite_link}`\n\n"
+                f"📲 *Use the menu below to check your balance, complete tasks, or withdraw your earnings.*\n\n"
+                f"✨ *Let's start your journey to financial freedom!*",
                 reply_markup=reply_markup
             )
+
         except Exception as e:
             logger.error(f"Error in start command: {e}")
             await update.message.reply_text("❌ An error occurred. Please try again later.")
@@ -314,7 +318,7 @@ class AirdropBot:
                 return
 
             if not context.args:
-                await update.message.reply_text("🪙 *Usage*:\n/wallet 0xYourBEP20Address")
+                await update.message.reply_text("🪙 *Usage*:\n`/wallet 0xYourBEP20Address`")
                 return
 
             wallet = context.args[0].strip()
@@ -326,7 +330,7 @@ class AirdropBot:
                 "UPDATE users SET wallet=? WHERE user_id=?", (wallet, user_id)
             )
             self.db.commit()
-            await update.message.reply_text(f"✅ *Wallet saved for USDT withdrawals*:\n`{wallet}`")
+            await update.message.reply_text(f"✅ *Wallet saved for USDT withdrawals*:\n`{escape_markdown(wallet)}`")
         except Exception as e:
             logger.error(f"Error in set_wallet command: {e}")
             await update.message.reply_text("❌ An error occurred. Please try again later.")
