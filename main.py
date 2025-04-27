@@ -171,6 +171,7 @@ class AirdropBot:
         callback_data = query.data
 
         try:
+            logger.debug(f"Received callback data: {callback_data} from user {user_id}")
             if await self._check_ban(user_id) and callback_data not in ["start", "admin_dashboard"]:
                 await query.message.reply_text("🚫 You are banned from using this bot.")
                 await query.answer()
@@ -230,12 +231,13 @@ class AirdropBot:
                 await query.message.reply_text("📋 *Main Menu*\nChoose an option:", reply_markup=reply_markup)
                 await query.answer()
             else:
+                logger.warning(f"Invalid callback data received: {callback_data}")
                 await query.message.reply_text("🚫 Invalid action.")
                 await query.answer()
                 return
 
         except Exception as e:
-            logger.error(f"Error in handle_button: {e}")
+            logger.error(f"Error in handle_button: {e}", exc_info=True)
             await query.message.reply_text("❌ An error occurred. Please try again later.")
             await query.answer()
 
@@ -254,19 +256,25 @@ class AirdropBot:
                 return
 
             username = update.effective_user.username or "N/A"
-            self.db.execute_query(
-                "INSERT OR IGNORE INTO users (user_id, username, balance, referrals) VALUES (?, ?, 0, 0)",
-                (user_id, username)
-            )
+            referrer_id = None
+            referral_bonus = 8  # Existing $8 bonus for referrer
 
+            # Check for referral
             if context.args and context.args[0].isdigit():
                 ref_id = int(context.args[0])
                 if ref_id != user_id and not await self._check_ban(ref_id):
+                    referrer_id = ref_id
                     self.db.execute_query(
-                        "UPDATE users SET referrals = referrals + 1, balance = balance + 8 WHERE user_id=?",
-                        (ref_id,)
+                        "UPDATE users SET referrals = referrals + 1, balance = balance + ? WHERE user_id=?",
+                        (referral_bonus, ref_id)
                     )
+                    logger.info(f"Referral bonus of ${referral_bonus} credited to referrer {ref_id} for user {user_id}")
 
+            # Insert or update user with referrer_id
+            self.db.execute_query(
+                "INSERT OR IGNORE INTO users (user_id, username, balance, referrals, referrer_id) VALUES (?, ?, 0, 0, ?)",
+                (user_id, username, referrer_id)
+            )
             self.db.commit()
 
             bot_username = (await context.bot.get_me()).username
@@ -368,23 +376,38 @@ class AirdropBot:
                 await query.message.reply_text("⏳ You already have a pending withdrawal.")
                 return
 
+            # Insert withdrawal request and get the inserted ID
             self.db.execute_query(
                 "INSERT INTO withdrawals (user_id, amount, status, wallet) VALUES (?, ?, 'pending', ?)",
                 (user_id, balance, wallet)
             )
             self.db.commit()
 
+            # Retrieve the withdrawal ID
+            withdrawal_id = self.db.execute_query(
+                "SELECT id FROM withdrawals WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()[0]
+
+            logger.info(f"Withdrawal request submitted by user {user_id}: Amount=${balance:.2f}, Wallet={wallet}, Withdrawal ID={withdrawal_id}")
+
             await query.message.reply_text("✅ *Withdrawal request submitted for admin approval.*")
+            # Send notification to admin with Approve and Reject buttons
+            reply_markup = self._get_withdrawal_action_keyboard(withdrawal_id)
             await context.bot.send_message(
                 ADMIN_ID,
                 f"📬 *New USDT Withdrawal Request*:\n"
-                f"👤 User: {user_id}\n"
-                f"💰 Amount: ${balance:.2f}\n"
-                f"💼 Wallet: `{wallet}`"
+                f"🆔 *Withdrawal ID*: {withdrawal_id}\n"
+                f"👤 *User*: {user_id}\n"
+                f"💰 *Amount*: ${balance:.2f}\n"
+                f"💼 *Wallet*: `{wallet}`\n\n"
+                f"🔧 *Action*:",
+                reply_markup=reply_markup
             )
+            logger.info(f"Sent withdrawal request notification to admin for Withdrawal ID {withdrawal_id}")
 
         except Exception as e:
-            logger.error(f"Error in withdraw command: {e}")
+            logger.error(f"Error in withdraw command for user {user_id}: {e}", exc_info=True)
             await query.message.reply_text("❌ An error occurred. Please try again later.")
 
     async def admin_view_users(self, query: Update, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
@@ -455,32 +478,38 @@ class AirdropBot:
 
     async def admin_approve_withdrawal(self, query: Update, context: ContextTypes.DEFAULT_TYPE, withdrawal_id: int) -> None:
         try:
+            logger.info(f"Admin attempting to approve withdrawal ID: {withdrawal_id}")
             withdrawal = self.db.execute_query(
                 "SELECT user_id, amount, wallet FROM withdrawals WHERE id=? AND status='pending'",
                 (withdrawal_id,)
             ).fetchone()
 
             if not withdrawal:
+                logger.warning(f"Withdrawal ID {withdrawal_id} not found or already processed")
                 await query.message.reply_text("❌ Withdrawal request not found or already processed.")
                 return
 
             user_id, amount, wallet = withdrawal
             usdt_amount = int(amount * 10**6)
+            logger.info(f"Processing withdrawal for user {user_id}: Amount=${amount:.2f}, Wallet={wallet}")
 
+            # Check bot's USDT balance
             bot_usdt_balance = self.usdt_contract.functions.balanceOf(self.bot_address).call()
             if bot_usdt_balance < usdt_amount:
-                logger.error(f"Insufficient USDT balance: {bot_usdt_balance / 10**6} USDT")
+                logger.error(f"Insufficient USDT balance: {bot_usdt_balance / 10**6} USDT for withdrawal ID {withdrawal_id}")
                 await query.message.reply_text("❌ Insufficient USDT in bot wallet.")
                 return
 
+            # Check BNB balance for gas
             bnb_balance = self.web3.eth.get_balance(self.bot_address)
             gas_price = self.web3.eth.gas_price
             gas_limit = 100000
             if bnb_balance < gas_price * gas_limit:
-                logger.error(f"Insufficient BNB: {bnb_balance / 10**18} BNB")
+                logger.error(f"Insufficient BNB: {bnb_balance / 10**18} BNB for withdrawal ID {withdrawal_id}")
                 await query.message.reply_text("❌ Insufficient BNB for gas.")
                 return
 
+            # Build and send transaction
             user_wallet = Web3.to_checksum_address(wallet)
             tx = self.usdt_contract.functions.transfer(user_wallet, usdt_amount).build_transaction({
                 'from': self.bot_address,
@@ -490,11 +519,13 @@ class AirdropBot:
                 'chainId': 97  # BSC testnet
             })
 
+            logger.info(f"Signing and sending transaction for withdrawal ID {withdrawal_id}")
             signed_tx = self.web3.eth.account.sign_transaction(tx, private_key=BOT_PRIVATE_KEY)
             tx_hash = self.web3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
 
             if tx_receipt.status == 1:
+                logger.info(f"Withdrawal ID {withdrawal_id} approved successfully. Tx Hash: {tx_hash.hex()}")
                 self.db.execute_query(
                     "UPDATE withdrawals SET status='completed', tx_hash=? WHERE id=?",
                     (tx_hash.hex(), withdrawal_id)
@@ -503,6 +534,28 @@ class AirdropBot:
                     "UPDATE users SET balance = balance - ? WHERE user_id=?",
                     (amount, user_id)
                 )
+
+                # Check for referrer and credit 5% commission
+                referrer_data = self.db.execute_query(
+                    "SELECT referrer_id FROM users WHERE user_id=?", (user_id,)
+                ).fetchone()
+                if referrer_data and referrer_data[0]:
+                    referrer_id = referrer_data[0]
+                    commission = amount * 0.05  # 5% of withdrawal amount
+                    self.db.execute_query(
+                        "UPDATE users SET balance = balance + ? WHERE user_id=?",
+                        (commission, referrer_id)
+                    )
+                    logger.info(f"Credited ${commission:.2f} (5% commission) to referrer {referrer_id} for user {user_id}'s withdrawal ID {withdrawal_id}")
+                    await context.bot.send_message(
+                        referrer_id,
+                        f"🎉 *Referral Commission Received!*\n"
+                        f"💰 *Amount*: ${commission:.2f} (5% of referred user's withdrawal)\n"
+                        f"👤 *Referred User*: {user_id}\n"
+                        f"🆔 *Withdrawal ID*: {withdrawal_id}"
+                    )
+                    logger.info(f"Sent commission notification to referrer {referrer_id} for Withdrawal ID {withdrawal_id}")
+
                 self.db.commit()
 
                 await query.message.reply_text(
@@ -517,8 +570,9 @@ class AirdropBot:
                     f"📤 Tx Hash: `{tx_hash.hex()}`\n"
                     f"🔗 Explorer: https://testnet.bscscan.com/tx/{tx_hash.hex()}"
                 )
+                logger.info(f"Sent approval notification to user {user_id} for Withdrawal ID {withdrawal_id}")
             else:
-                logger.error(f"USDT Transaction failed: {tx_receipt}")
+                logger.error(f"Transaction failed for withdrawal ID {withdrawal_id}. Tx Hash: {tx_hash.hex()}, Receipt: {tx_receipt}")
                 self.db.execute_query(
                     "UPDATE withdrawals SET status='failed', tx_hash=? WHERE id=?",
                     (tx_hash.hex(), withdrawal_id)
@@ -529,30 +583,36 @@ class AirdropBot:
                     user_id,
                     f"❌ Your USDT withdrawal of ${amount:.2f} failed. Please contact admin."
                 )
+                logger.info(f"Sent failure notification to user {user_id} for Withdrawal ID {withdrawal_id}")
 
             reply_markup = self._get_withdrawal_list_keyboard(1)
             await query.message.reply_text("📬 *Pending Withdrawals*", reply_markup=reply_markup)
         except Exception as e:
-            logger.error(f"Error in admin_approve_withdrawal: {e}")
+            logger.error(f"Error approving withdrawal ID {withdrawal_id}: {str(e)}", exc_info=True)
             await query.message.reply_text("❌ An error occurred. Please try again later.")
 
     async def admin_reject_withdrawal(self, query: Update, context: ContextTypes.DEFAULT_TYPE, withdrawal_id: int) -> None:
         try:
+            logger.info(f"Admin attempting to reject withdrawal ID: {withdrawal_id}")
             withdrawal = self.db.execute_query(
                 "SELECT user_id, amount FROM withdrawals WHERE id=? AND status='pending'",
                 (withdrawal_id,)
             ).fetchone()
 
             if not withdrawal:
+                logger.warning(f"Withdrawal ID {withdrawal_id} not found or already processed")
                 await query.message.reply_text("❌ Withdrawal request not found or already processed.")
                 return
 
             user_id, amount = withdrawal
+            logger.info(f"Rejecting withdrawal for user {user_id}: Amount=${amount:.2f}")
+
             self.db.execute_query(
                 "UPDATE withdrawals SET status='rejected' WHERE id=?",
                 (withdrawal_id,)
             )
             self.db.commit()
+            logger.info(f"Withdrawal ID {withdrawal_id} rejected successfully")
 
             await query.message.reply_text(
                 f"❌ *Withdrawal rejected!*\n"
@@ -563,11 +623,12 @@ class AirdropBot:
                 user_id,
                 f"❌ Your USDT withdrawal of ${amount:.2f} was rejected by the admin."
             )
+            logger.info(f"Sent rejection notification to user {user_id} for Withdrawal ID {withdrawal_id}")
 
             reply_markup = self._get_withdrawal_list_keyboard(1)
             await query.message.reply_text("📬 *Pending Withdrawals*", reply_markup=reply_markup)
         except Exception as e:
-            logger.error(f"Error in admin_reject_withdrawal: {e}")
+            logger.error(f"Error rejecting withdrawal ID {withdrawal_id}: {str(e)}", exc_info=True)
             await query.message.reply_text("❌ An error occurred. Please try again later.")
 
     async def admin_export_users(self, query: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
